@@ -122,6 +122,6 @@ process.on("SIGINT", () => {
 });
 
 // --- Start 
-console.log("🚀 Smart Transaction Stack — Phase 1");
-console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+console.log("🚀 Smart Transaction Stack");
+console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 connectAndStream();
