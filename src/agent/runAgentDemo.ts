@@ -35,8 +35,11 @@ async function main() {
     const result = await decideTip(scenarios[i]);
 
     console.log(result.reasoning);
-    console.log(`\nFinal decision: ${result.tipLamports} lamports\n`);
-    console.log("=========================================================\n");
+    console.log(`\nFinal decision: ${result.tipLamports} lamports`);
+    if (result.usedFallback) {
+      console.log(`(FALLBACK USED — agent format was not followed)`);
+    }
+    console.log("\n=========================================================\n");
   }
 }
 

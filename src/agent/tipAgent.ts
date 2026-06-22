@@ -19,6 +19,7 @@ export interface TipDecisionInput {
 export interface TipDecisionOutput {
   tipLamports: number;
   reasoning: string;
+  usedFallback: boolean
 }
 
 export async function decideTip(input: TipDecisionInput): Promise<TipDecisionOutput> {
@@ -41,8 +42,13 @@ Reason step-by-step about the optimal tip amount. Consider:
 3. Recent failure rate — if recent bundles failed, consider raising the tip
 4. Urgency — fewer slots until the Jito leader window means less room to retry if this tip is too low
 
-End your response with exactly this format on its own line:
-TIP: <integer_lamports>`;
+End your response with EXACTLY this line, with no other text after it, and no markdown formatting around it:
+TIP: <integer_lamports>
+
+Example of correct ending:
+TIP: 42000
+
+Do not write a range. Do not write additional commentary after this line. Output one single integer.`;
 
   const message = await anthropic.messages.create({
     model: "claude-sonnet-4-6",
@@ -54,10 +60,26 @@ TIP: <integer_lamports>`;
   const fullText = textBlock && "text" in textBlock ? textBlock.text : "";
 
   const tipMatch = fullText.match(/TIP:\s*(\d+)/);
-  const tipLamports = tipMatch ? parseInt(tipMatch[1], 10) : input.tipPercentiles.p50;
 
-  return {
-    tipLamports,
-    reasoning: fullText.trim(),
-  };
+let tipLamports: number;
+let usedFallback = false;
+
+if (tipMatch) {
+  tipLamports = parseInt(tipMatch[1], 10);
+} else {
+  // The model didn't follow the output format — this is a real problem,
+  // not a normal path. Log it loudly so it's never silently hidden.
+  usedFallback = true;
+  tipLamports = input.tipPercentiles.p50;
+  console.warn(
+    "\n⚠️  WARNING: Agent did not return a parseable TIP line. " +
+    "Falling back to p50 — this decision was NOT reasoned by the agent.\n"
+  );
+}
+
+return {
+  tipLamports,
+  reasoning: fullText.trim(),
+  usedFallback,
+};
 }
