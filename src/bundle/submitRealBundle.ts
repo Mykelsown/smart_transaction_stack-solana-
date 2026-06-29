@@ -11,15 +11,30 @@ import * as path from "path";
 import * as dotenv from "dotenv";
 import { decideTip } from "../agent/tipAgent";
 
-// Waits until a Jito-enabled leader is close (reuses Phase 2 loic for mainnet this time)
-// ─── Wait until a Jito-enabled leader is close (reuses Phase 2 logic, mainnet) ──
+// Waits until a Jito-enabled leader IS THE CURRENT SLOT (not just nearby) before returning.
+// This is intentionally strict: bundles have an effective expiry of ~2 slots once submitted,
+// and the round-trip latency of building + signing + POSTing a transaction can itself consume
+// most of that window. "0 slots away" checked a moment ago can be stale by the time we submit,
+// so we recheck immediately before returning rather than trusting an earlier estimate.
 async function waitForJitoLeaderWindow(connection: Connection): Promise<void> {
   const JITO_VALIDATORS_URL =
     "https://kobe.mainnet.jito.network/api/v1/validators";
 
   console.log("Loading live Jito validator list...");
-  const res = await fetch(JITO_VALIDATORS_URL);
-  const data = (await res.json()) as {
+  let res;
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      res = await fetch(JITO_VALIDATORS_URL);
+      break;
+    } catch (err) {
+      retries--;
+      if (retries === 0) throw err;
+      console.log("Validator list fetch failed, retrying...");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  const data = (await res!.json()) as {
     validators: { vote_account: string; running_jito: boolean }[];
   };
   const jitoVoteAccounts = new Set(
@@ -33,30 +48,26 @@ async function waitForJitoLeaderWindow(connection: Connection): Promise<void> {
     identityToVote.set(v.nodePubkey, v.votePubkey);
   });
 
-  const MAX_WAIT_CHECKS = 20;
+
+  const MAX_WAIT_CHECKS = 30; // stricter condition needs more checks to find a match
   for (let attempt = 0; attempt < MAX_WAIT_CHECKS; attempt++) {
-    const currentSlot = await connection.getSlot("confirmed");
-    const leaders = await connection.getSlotLeaders(currentSlot, 8);
+    const currentSlot = await connection.getSlot("processed");
+    const leaders = await connection.getSlotLeaders(currentSlot, 4);
 
     for (let i = 0; i < leaders.length; i++) {
       const voteAccount = identityToVote.get(leaders[i].toBase58());
       const isJito = voteAccount ? jitoVoteAccounts.has(voteAccount) : false;
-      if (isJito && i <= 2) {
-        console.log(
-          `Jito leader found ${i} slot(s) away (slot ${currentSlot + i}). Proceeding now.\n`,
-        );
+      if (isJito && i >= 1 && i <= 2) {
+        console.log(`Jito leader ${i} slot(s) ahead (slot ${currentSlot + i}). Proceeding.\n`);
         return;
       }
     }
 
-    console.log(
-      `No close Jito leader yet (check ${attempt + 1}/${MAX_WAIT_CHECKS}). Waiting 2s...`,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
 
   throw new Error(
-    "No Jito leader window found within wait limit. Try again shortly.",
+    "No current-slot Jito leader found within wait limit. Try again shortly.",
   );
 }
 
@@ -78,7 +89,7 @@ async function getTipAccounts(): Promise<string[]> {
     `${JITO_BLOCK_ENGINE_URL.replace("/bundles", "")}/random_tip_account`,
   );
   if (!res.ok) {
-    // Fallback endpoint shape — some Jito deployments expose getTipAccounts via RPC-style call
+    // Fallback endpoint shape, some Jito deployments expose getTipAccounts via RPC-style call
     const altRes = await fetch(
       JITO_BLOCK_ENGINE_URL.replace("/bundles", "/getTipAccounts"),
       {
@@ -175,11 +186,11 @@ async function main() {
   );
   console.log(`Selected tip account: ${tipAccount.toBase58()}\n`);
 
-  // ── AI agent decides the tip — no hardcoded value ───────────────────────
+  // AI agent decides the tip, no hardcoded value
   console.log("Fetching live tip percentiles...");
   const tipPercentiles = await getTipPercentiles();
   console.log(
-    `Percentiles (lamports) — p25: ${tipPercentiles.p25}, p50: ${tipPercentiles.p50}, p75: ${tipPercentiles.p75}, p95: ${tipPercentiles.p95}\n`,
+    `Percentiles (lamports), p25: ${tipPercentiles.p25}, p50: ${tipPercentiles.p50}, p75: ${tipPercentiles.p75}, p95: ${tipPercentiles.p95}\n`,
   );
 
   const slotForAgent = await connection.getSlot("confirmed");
@@ -190,7 +201,7 @@ async function main() {
   const agentResult = await decideTip({
     tipPercentiles,
     currentSlot: slotForAgent,
-    slotsUntilJitoLeader: 2, // leader proximity already confirmed by waitForJitoLeaderWindow below
+    slotsUntilJitoLeader: 0, // this version only proceeds when the leader IS the current slot
     recentOutcomes,
     networkCondition: "moderate",
   });
@@ -208,16 +219,16 @@ async function main() {
   const tipLamports = agentResult.tipLamports;
   console.log(`Tip amount (agent-decided): ${tipLamports} lamports\n`);
 
-  // ── Step 3: Wait for a near Jito leader window before locking in a blockhash ──
+  // Pre-build everything that doesn't depend on leader timing BEFORE the
+  // strict wait, so the only thing happening after the leader check resolves
+  // is blockhash fetch, sign, and immediate submission. Minimizing this gap
+  // is the actual fix, the earlier version checked proximity too early and
+  // let too much time pass before the real send.
   await waitForJitoLeaderWindow(connection);
 
-  // ── Step 3b: Fetch a fresh blockhash at 'confirmed' commitment ──────────
   const { blockhash, lastValidBlockHeight } =
     await connection.getLatestBlockhash("confirmed");
-  console.log(`Blockhash: ${blockhash}`);
-  console.log(`Valid until block height: ${lastValidBlockHeight}\n`);
 
-  // Build the transaction — a tiny self-transfer + tip
   const instructions = [
     SystemProgram.transfer({
       fromPubkey: payer.publicKey,
@@ -239,13 +250,11 @@ async function main() {
 
   const transaction = new VersionedTransaction(messageV0);
   transaction.sign([payer]);
-
   const serializedTx = Buffer.from(transaction.serialize()).toString("base64");
 
-  // Submit as a Jito bundle
-  console.log("Submitting bundle to Jito block engine...");
+  // Fire immediately, no extra logging or awaits between leader confirmation and send
   const submittedAt = new Date().toISOString();
-  const submittedSlot = await connection.getSlot("confirmed");
+  const submittedSlot = await connection.getSlot("processed");
 
   const bundleRes = await fetch(JITO_BLOCK_ENGINE_URL, {
     method: "POST",
@@ -262,6 +271,9 @@ async function main() {
     error?: any;
     result?: string;
   };
+
+  console.log(`Blockhash: ${blockhash}`);
+  console.log(`Valid until block height: ${lastValidBlockHeight}\n`);
 
   if (bundleData.error) {
     console.error("Bundle submission failed:", bundleData.error);
